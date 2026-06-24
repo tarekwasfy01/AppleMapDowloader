@@ -923,6 +923,124 @@ def expand_frame_url_grid(
 
 
 
+
+
+def cropped_frame_bounds_from_request_bounds(
+    request_bounds: Tuple[float, float, float, float],
+    z: int,
+    render_w: int,
+    render_h: int,
+    crop_left: int,
+    crop_top: int,
+    crop_right: int,
+    crop_bottom: int,
+) -> Tuple[float, float, float, float]:
+    """Return the geographic bbox of the actually cropped screenshot area.
+
+    request_bounds is the full Apple/frame WebView request bbox in lon/lat
+    order (west, south, east, north). This helper converts that full frame to
+    Web-Mercator world pixels, removes the crop margins in the same pixel space,
+    and converts the remaining cropped rectangle back to lon/lat.
+
+    This is the safest georeferencing mode for Apple frame captures because the
+    GeoTIFF is tied to the image that is actually written after crop, not to the
+    marker bbox or to the synthetic screenshot step.
+    """
+    west, south, east, north = map(float, request_bounds)
+    z = int(z)
+    render_w = max(1, int(render_w))
+    render_h = max(1, int(render_h))
+    crop_left = max(0, int(crop_left))
+    crop_top = max(0, int(crop_top))
+    crop_right = max(0, int(crop_right))
+    crop_bottom = max(0, int(crop_bottom))
+
+    left_px, top_px = lonlat_to_world_pixel(west, north, z)
+    right_px, bottom_px = lonlat_to_world_pixel(east, south, z)
+    full_w_px = max(1e-9, right_px - left_px)
+    full_h_px = max(1e-9, bottom_px - top_px)
+
+    cropped_left_px = left_px + (float(crop_left) / float(render_w)) * full_w_px
+    cropped_top_px = top_px + (float(crop_top) / float(render_h)) * full_h_px
+    cropped_right_px = right_px - (float(crop_right) / float(render_w)) * full_w_px
+    cropped_bottom_px = bottom_px - (float(crop_bottom) / float(render_h)) * full_h_px
+    if cropped_right_px <= cropped_left_px or cropped_bottom_px <= cropped_top_px:
+        return (west, south, east, north)
+    return world_pixel_bbox_to_lonlat(cropped_left_px, cropped_top_px, cropped_right_px, cropped_bottom_px, z)
+
+
+def center_georef_bounds_from_request_bounds(
+    request_bounds: Tuple[float, float, float, float],
+    z: int,
+    visible_w_px: int,
+    visible_h_px: int,
+) -> Tuple[float, float, float, float]:
+    """Georeference one cropped Apple screenshot from the Apple URL center.
+
+    The Apple frame URL is center/span based. For georeferencing we therefore
+    treat the URL center as the center of the saved cropped tile and derive the
+    tile bounds from the final cropped output size in Web-Mercator pixels.
+    This deliberately ignores the theoretical selector bbox and avoids
+    double-applying crop offsets to the GeoTIFF.
+    """
+    west, south, east, north = map(float, request_bounds)
+    z = int(z)
+    visible_w_px = max(1, int(visible_w_px))
+    visible_h_px = max(1, int(visible_h_px))
+
+    left_px, top_px = lonlat_to_world_pixel(west, north, z)
+    right_px, bottom_px = lonlat_to_world_pixel(east, south, z)
+    center_x_px = (left_px + right_px) / 2.0
+    center_y_px = (top_px + bottom_px) / 2.0
+
+    return world_pixel_bbox_to_lonlat(
+        center_x_px - (float(visible_w_px) / 2.0),
+        center_y_px - (float(visible_h_px) / 2.0),
+        center_x_px + (float(visible_w_px) / 2.0),
+        center_y_px + (float(visible_h_px) / 2.0),
+        z,
+    )
+
+
+def center_georef_grid_bounds_from_first_request(
+    request_bounds: Tuple[float, float, float, float],
+    z: int,
+    cols: int,
+    rows: int,
+    visible_w_px: int,
+    visible_h_px: int,
+    effective_step_x_px: float,
+    effective_step_y_px: float,
+) -> Tuple[float, float, float, float]:
+    """Return full mosaic bounds from the first Apple URL center.
+
+    The screenshot URLs move by the effective center step
+    (visible size * step multiplier + fixed frame shift). The GeoTIFF bounds
+    must use the same center spacing; otherwise the mosaic is scaled/shifted
+    when FrameShift is non-zero.
+    """
+    west, south, east, north = map(float, request_bounds)
+    z = int(z)
+    cols = max(1, int(cols))
+    rows = max(1, int(rows))
+    visible_w_px = max(1, int(visible_w_px))
+    visible_h_px = max(1, int(visible_h_px))
+    effective_step_x_px = max(1.0, float(effective_step_x_px))
+    effective_step_y_px = max(1.0, float(effective_step_y_px))
+
+    left_px, top_px = lonlat_to_world_pixel(west, north, z)
+    right_px, bottom_px = lonlat_to_world_pixel(east, south, z)
+    center_x_px = (left_px + right_px) / 2.0
+    center_y_px = (top_px + bottom_px) / 2.0
+
+    grid_left_px = center_x_px - (float(visible_w_px) / 2.0)
+    grid_top_px = center_y_px - (float(visible_h_px) / 2.0)
+    grid_right_px = center_x_px + (float(cols - 1) * effective_step_x_px) + (float(visible_w_px) / 2.0)
+    grid_bottom_px = center_y_px + (float(rows - 1) * effective_step_y_px) + (float(visible_h_px) / 2.0)
+
+    return world_pixel_bbox_to_lonlat(grid_left_px, grid_top_px, grid_right_px, grid_bottom_px, z)
+
+
 def ensure_python_package(import_name: str, pip_name: Optional[str] = None, log_cb=None):
     """Import a package, installing it with pip on demand.
 
@@ -2387,10 +2505,27 @@ class PySideMapStitcher(QMainWindow):
             cols = max(calc_cols, min_cols)
             rows = max(calc_rows, min_rows)
 
-            grid_right_px = sel_left_px + cols * effective_step_x_px
-            grid_bottom_px = sel_top_px + rows * effective_step_y_px
+            # Apple georeferencing mode: anchor to the actual first cropped Apple frame,
+            # not the Google/field bbox. This includes crop margins and the Apple URL
+            # center/span math in the GeoTIFF origin.
+            _sample_url_calc, _sample_visible_calc, _sample_request_calc = expand_frame_url_grid(
+                cfg.url_template, 0, 0, cfg.z,
+                cfg.min_lon, cfg.max_lat,
+                0.0, 0.0,
+                0.0, 0.0,
+                visible_w, visible_h,
+                render_w, render_h,
+                crop_left, crop_top, crop_right, crop_bottom,
+                step_mult_x, step_mult_y, shift_x_px, shift_y_px, crop_correct_url,
+            )
+            anchor_crop_bounds = cropped_frame_bounds_from_request_bounds(
+                _sample_request_calc, cfg.z, render_w, render_h, crop_left, crop_top, crop_right, crop_bottom
+            )
+            anchor_left_px, anchor_top_px = lonlat_to_world_pixel(anchor_crop_bounds[0], anchor_crop_bounds[3], cfg.z)
+            grid_right_px = anchor_left_px + cols * float(visible_w)
+            grid_bottom_px = anchor_top_px + rows * float(visible_h)
             grid_west, grid_south, grid_east, grid_north = world_pixel_bbox_to_lonlat(
-                sel_left_px, sel_top_px, grid_right_px, grid_bottom_px, cfg.z
+                anchor_left_px, anchor_top_px, grid_right_px, grid_bottom_px, cfg.z
             )
 
             width = cols * visible_w
@@ -2568,12 +2703,12 @@ class PySideMapStitcher(QMainWindow):
             if cols != calc_cols or rows != calc_rows:
                 self.log_msg(f"Force min grid applied: calculated {calc_cols} x {calc_rows}, using {cols} x {rows}.")
 
-            grid_right_px = sel_left_px + cols * effective_step_x_px
-            grid_bottom_px = sel_top_px + rows * effective_step_y_px
-            grid_west, grid_south, grid_east, grid_north = world_pixel_bbox_to_lonlat(
-                sel_left_px, sel_top_px, grid_right_px, grid_bottom_px, cfg.z
-            )
-
+            # Build the first URL once and use its CROPPED/visible screenshot geometry
+            # as the georeferencing anchor. This is intentionally different from
+            # the old mode, which georeferenced the full output from the raw
+            # coordinate-field bbox. In Apple frame mode the real output tile is
+            # the cropped WebView screenshot, so the first cropped cell is the
+            # most stable top-left anchor for the streamed GeoTIFF.
             sample_url0, sample_visible0, sample_request0 = expand_frame_url_grid(
                 cfg.url_template, 0, 0, cfg.z,
                 cfg.min_lon, cfg.max_lat,
@@ -2591,6 +2726,20 @@ class PySideMapStitcher(QMainWindow):
             lon_per_px = 0.0
             lat_per_px = 0.0
 
+            # Apple CENTER georeferencing:
+            # Use the first Apple URL center as the first output-cell center.
+            # The full GeoTIFF extent uses the same effective center step as the
+            # Apple URL grid, including the fixed FrameShift X/Y values.
+            # This prevents a mismatch where the captures move by visible+shift
+            # but the GeoTIFF was still written as if each cell moved only by
+            # visible_w/visible_h pixels.
+            anchor_crop_bounds = center_georef_bounds_from_request_bounds(
+                sample_request0, cfg.z, visible_w, visible_h
+            )
+            grid_west, grid_south, grid_east, grid_north = center_georef_grid_bounds_from_first_request(
+                sample_request0, cfg.z, cols, rows, visible_w, visible_h, effective_step_x_px, effective_step_y_px
+            )
+
             width = cols * visible_w
             height = rows * visible_h
             self.frame_cell_w = visible_w
@@ -2605,8 +2754,11 @@ class PySideMapStitcher(QMainWindow):
             self.frame_visible_lat_span = float(visible_lat_span)
             self.frame_selected_west = float(cfg.min_lon)
             self.frame_selected_north = float(cfg.max_lat)
-            self.frame_grid_west = float(cfg.min_lon)
-            self.frame_grid_north = float(cfg.max_lat)
+            self.frame_anchor_visible_bounds = tuple(sample_visible0)
+            self.frame_anchor_request_bounds = tuple(sample_request0)
+            self.frame_anchor_crop_bounds = tuple(anchor_crop_bounds)
+            self.frame_grid_west = float(grid_west)
+            self.frame_grid_north = float(grid_north)
             self.frame_grid_east = float(grid_east)
             self.frame_grid_south = float(grid_south)
             self.frame_step_mult_x = float(step_mult_x)
@@ -2642,6 +2794,7 @@ class PySideMapStitcher(QMainWindow):
             count = max(1, min(16, int(self.frame_views_spin.value())))
             hidden = False
             self.log_msg("=== Frame Screenshot Grid mode ===")
+            self.log_msg("Apple CENTER georeferencing active: GeoTIFF uses the Apple frame URL center and the effective center step incl. FrameShift.")
             self.log_msg("Manual alignment mode: effective step = visible pixels * Pixel step multiplier + Frame shift px/cell.")
             self.log_msg("Crop-aware alignment mode active: Apple URL center/span includes crop L/T/R/B, with the same center-shift logic on all sides.")
             if crop_correct_url:
@@ -2651,7 +2804,10 @@ class PySideMapStitcher(QMainWindow):
             self.log_msg("Tip: X/Y shift negative = screenshots closer/more overlap; positive = farther apart. PyPI stitching is off by default.")
             self.log_msg(f"Crop URL correction: {'ON' if crop_correct_url else 'OFF'}")
             self.log_msg(f"Selected bbox fields: S={cfg.min_lat:.8f}, W={cfg.min_lon:.8f}, N={cfg.max_lat:.8f}, E={cfg.max_lon:.8f}")
-            self.log_msg(f"Grid coverage: S={self.frame_grid_south:.8f}, W={self.frame_grid_west:.8f}, N={self.frame_grid_north:.8f}, E={self.frame_grid_east:.8f}")
+            self.log_msg(f"First synthetic visible-cell bounds diagnostic: S={sample_visible0[1]:.8f}, W={sample_visible0[0]:.8f}, N={sample_visible0[3]:.8f}, E={sample_visible0[2]:.8f}")
+            self.log_msg(f"First screenshot requested full-frame bounds: S={sample_request0[1]:.8f}, W={sample_request0[0]:.8f}, N={sample_request0[3]:.8f}, E={sample_request0[2]:.8f}")
+            self.log_msg(f"First CENTER-based Apple-frame georef bounds: S={anchor_crop_bounds[1]:.8f}, W={anchor_crop_bounds[0]:.8f}, N={anchor_crop_bounds[3]:.8f}, E={anchor_crop_bounds[2]:.8f}")
+            self.log_msg(f"GeoTIFF grid coverage from Apple centers: S={self.frame_grid_south:.8f}, W={self.frame_grid_west:.8f}, N={self.frame_grid_north:.8f}, E={self.frame_grid_east:.8f}")
             self.log_msg(f"Render size: {render_w}x{render_h} px")
             self.log_msg("Screen note: monitor may be 2560x1440, but renderer capture is forced to exact Render W/H so offsets stay correct.")
             self.log_msg(f"Crop L/T/R/B: {crop_left}/{crop_top}/{crop_right}/{crop_bottom} px")
@@ -2770,8 +2926,12 @@ class PySideMapStitcher(QMainWindow):
             float(getattr(self, "frame_shift_y_px", 0.0)),
             bool(getattr(self, "frame_crop_correct_url", False)),
         )
+        actual_cropped_bounds = center_georef_bounds_from_request_bounds(
+            request_bounds, job.z, self.frame_cell_w, self.frame_cell_h
+        )
         item["url"] = url
-        item["visible_bounds"] = visible_bounds
+        item["visible_bounds"] = actual_cropped_bounds
+        item["synthetic_visible_bounds"] = visible_bounds
         item["request_bounds"] = request_bounds
 
         if self.frame_done == 0:
@@ -2779,7 +2939,7 @@ class PySideMapStitcher(QMainWindow):
         if item.get("index", 0) < 4:
             self.log_msg(
                 f"Frame renderer {item.get('index')} loading cell col={job.col} row={job.row}; "
-                f"visible={visible_bounds}; request={request_bounds}"
+                f"center_georef={actual_cropped_bounds}; synthetic_visible={visible_bounds}; request={request_bounds}"
             )
 
         view = item["view"]
