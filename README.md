@@ -1,5 +1,5 @@
 # AppleMapDownloader
-
+## At the moment you can only download with zoom 18!
 AppleMapDownloader is a lightweight desktop application for downloading and stitching large map areas into high-resolution raster outputs. It supports multi-threaded downloading, automatic image stitching, GeoTIFF export, BigTIFF support, and georeferenced outputs suitable for GIS workflows.
 
 The project was developed as a companion utility for PyMapStitcher, allowing users to generate large map mosaics and geospatial imagery for research, GIS, remote sensing, archaeology, and mapping projects.
