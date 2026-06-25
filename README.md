@@ -30,7 +30,7 @@ https://github.com/tarekwasfy01/AppleMapDownloader/releases/download/AppleMapDow
 
 Download the MacOs installer:
 
-
+https://github.com/tarekwasfy01/AppleMapDownloader/releases/download/AppleMapDownloaderv.1.0/AppleMapDownloader-1.0.5.pkg
 
 Related Project: PyMapStitcher
 
