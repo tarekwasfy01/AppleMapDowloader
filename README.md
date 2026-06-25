@@ -22,7 +22,7 @@ https://github.com/tarekwasfy01/AppleMapDowloader/releases/download/AppleMapDown
 Download the latest Setup here:
 
 https://github.com/tarekwasfy01/AppleMapDowloader/releases/download/AppleMapDownloaderv.1.0/AppleMapDownloader-Setup-1.0.0.exe
-No Python installation is required for the OneFile release.
+
 
 Related Project: PyMapStitcher
 
