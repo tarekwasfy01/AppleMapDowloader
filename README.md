@@ -19,9 +19,17 @@ Windows OneFile Executable
 Download the latest standalone Windows executable:
 
 https://github.com/tarekwasfy01/AppleMapDowloader/releases/download/AppleMapDownloaderv.1.0/AppleMapDownloader.exe
+
 Download the latest Setup here:
 
 https://github.com/tarekwasfy01/AppleMapDowloader/releases/download/AppleMapDownloaderv.1.0/AppleMapDownloader-Setup-1.0.0.exe
+
+Download the Linux installer:
+
+https://github.com/tarekwasfy01/AppleMapDownloader/releases/download/AppleMapDownloaderv.1.0/AppleMapDownloader_Setup_OneDir.exe
+
+Download the MacOs installer:
+
 
 
 Related Project: PyMapStitcher
