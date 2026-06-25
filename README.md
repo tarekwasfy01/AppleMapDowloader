@@ -19,7 +19,9 @@ Windows OneFile Executable
 Download the latest standalone Windows executable:
 
 https://github.com/tarekwasfy01/AppleMapDowloader/releases/download/AppleMapDownloaderv.1.0/AppleMapDownloader.exe
+Download the latest Setup here:
 
+https://github.com/tarekwasfy01/AppleMapDowloader/releases/download/AppleMapDownloaderv.1.0/AppleMapDownloader-Setup-1.0.0.exe
 No Python installation is required for the OneFile release.
 
 Related Project: PyMapStitcher
