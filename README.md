@@ -1,57 +1,14 @@
-# AppleMapDownloader
-## At the moment you can only download with zoom 18!
-AppleMapDownloader is a lightweight desktop application for downloading and stitching large map areas into high-resolution raster outputs. It supports multi-threaded downloading, automatic image stitching, GeoTIFF export, BigTIFF support, and georeferenced outputs suitable for GIS workflows.
+# QGIS Plugin Repository / Upload Checklist
 
-The project was developed as a companion utility for PyMapStitcher, allowing users to generate large map mosaics and geospatial imagery for research, GIS, remote sensing, archaeology, and mapping projects.
-
-Features
-Multi-threaded map downloading
-Large area stitching
-GeoTIFF and BigTIFF export
-Georeferenced outputs for GIS software
-Preview and map selection tools
-Standalone Windows executable available
-Python source code available
-Suitable for very large raster generation workflows
-Download
-Windows OneFile Executable
-
-Download the latest standalone Windows executable:
-
-https://github.com/tarekwasfy01/AppleMapDowloader/releases/download/AppleMapDownloaderv.1.0/AppleMapDownloader.exe
-Download the latest Setup here:
-
-https://github.com/tarekwasfy01/AppleMapDowloader/releases/download/AppleMapDownloaderv.1.0/AppleMapDownloader-Setup-1.0.0.exe
-
-
-Related Project: PyMapStitcher
-
-If you are looking for a more advanced GIS-oriented map stitching solution with support for extremely large datasets, BigTIFF generation, QGIS integration, and multiple installation options, please also check out PyMapStitcher.
-
-PyMapStitcher Website
-
-https://py-map-stitcher.com
-
-PyMapStitcher GitHub Repository
-
-https://github.com/tarekwasfy01/PyMapStitcher
-
-PyMapStitcher provides:
-
-GeoTIFF and BigTIFF export
-Large-area map downloading
-QGIS integration
-Windows, Linux, macOS support
-Python package availability
-GIS-ready workflows
-Advanced raster processing
-Disclaimer
-
-Users are responsible for ensuring that any downloaded map imagery complies with the terms of service, licensing conditions, and usage restrictions of the respective map providers. This software is intended for educational, research, and authorized use cases.
-
-Author
-
-Tarek Wasfy
-
-GitHub:
-https://github.com/tarekwasfy01
+- ZIP contains exactly one top-level folder: `AppleMapDownloaderQGIS/`.
+- Top-level plugin folder contains `metadata.txt`, `__init__.py`, and `LICENSE` without extension.
+- No `__pycache__`, `.pyc`, hidden macOS files, local virtual environments, build folders, or bundled binaries are included.
+- Metadata uses an English description and a unique version number: `0.2.5`.
+- Metadata includes `license=GNU GPL v2 or later`.
+- Public metadata links are set for homepage, tracker, and repository.
+- Before upload, push this exact plugin source to the public repository listed in `metadata.txt`.
+- The icon is included as `icon.png` and referenced in `metadata.txt`.
+- Tested target metadata: QGIS `3.22` through `3.99`; QGIS 4 compatibility is not claimed.
+- Plugin uses only Apple Maps frame rendering through an external Chromium-compatible browser backend.
+- Plugin does not bundle browser binaries, font files, credentials, API keys, or private user data.
+- External requirement is documented: Microsoft Edge, Google Chrome, Chromium, Brave, or Vivaldi must be installed separately.

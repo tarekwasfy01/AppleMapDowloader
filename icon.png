@@ -1,0 +1,929 @@
+
+# -*- coding: utf-8 -*-
+"""
+Apple Maps Downloader QGIS
+
+QGIS dock plugin for the Apple Map Downloader workflow:
+- appears in the QGIS Plugins menu and toolbar
+- lets the user draw a rectangle on the map canvas
+- uses an external Chromium/Edge browser for 1600 x 1600 Apple Maps captures
+- writes a georeferenced EPSG:3857 GeoTIFF/BigTIFF
+
+This build intentionally does not use QtWebEngine/QWebView. QGIS has Qt/PyQt for
+its UI, but many QGIS builds do not ship a Python WebEngine binding. Therefore
+browser rendering is delegated to Microsoft Edge, Google Chrome, Chromium, Brave,
+or Vivaldi in headless screenshot mode.
+
+Important: Use only services/content for which you have permission. The plugin
+renders browser pages and captures them; it does not bypass access controls.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import platform
+import shutil
+import subprocess
+import tempfile
+import time
+import traceback
+import webbrowser
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+from urllib.parse import quote
+
+from qgis.PyQt.QtCore import QObject, Qt, QThread, pyqtSignal
+from qgis.PyQt.QtGui import QColor, QIcon, QPixmap
+from qgis.PyQt.QtWidgets import (
+    QAction,
+    QCheckBox,
+    QDockWidget,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QPlainTextEdit,
+    QProgressBar,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+from qgis.core import (
+    Qgis,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsMessageLog,
+    QgsPointXY,
+    QgsProject,
+    QgsRasterLayer,
+    QgsRectangle,
+    QgsWkbTypes,
+)
+from qgis.gui import QgsMapTool, QgsRubberBand
+
+try:
+    from osgeo import gdal, osr
+except Exception:  # pragma: no cover - QGIS normally ships GDAL
+    gdal = None
+    osr = None
+
+PLUGIN_NAME = "Apple Maps Downloader QGIS"
+MENU_NAME = "&Apple Maps Downloader"
+TILE_SIZE = 256
+WEB_MERCATOR_RADIUS = 6378137.0
+FIXED_ZOOM = 18
+FIXED_RENDER_WIDTH = 1600
+FIXED_RENDER_HEIGHT = 1600
+CROP_LEFT = 300
+CROP_TOP = 0
+CROP_RIGHT = 100
+CROP_BOTTOM = 100
+VISIBLE_RENDER_WIDTH = FIXED_RENDER_WIDTH - CROP_LEFT - CROP_RIGHT
+VISIBLE_RENDER_HEIGHT = FIXED_RENDER_HEIGHT - CROP_TOP - CROP_BOTTOM
+FRAME_SHIFT_X_PX = 260
+FRAME_SHIFT_Y_PX = 330
+EFFECTIVE_STEP_X_PX = VISIBLE_RENDER_WIDTH + FRAME_SHIFT_X_PX
+EFFECTIVE_STEP_Y_PX = VISIBLE_RENDER_HEIGHT + FRAME_SHIFT_Y_PX
+DEFAULT_WAIT_SECONDS = 8
+MAX_CELL_WARNING = 2000
+
+APPLE_MAPS_FRAME_URL = (
+    "https://maps.apple.com/frame?map=satellite"
+    "&center={center_lat}%2C{center_lon}"
+    "&span={lat_span}%2C{lon_span}"
+    "&z={z}"
+    "&__qgis_cell={cell_id}"
+)
+
+
+@dataclass(frozen=True)
+class RenderJob:
+    col: int
+    row: int
+    xoff: int
+    yoff: int
+    width: int
+    height: int
+    url: str
+
+
+@dataclass
+class RenderConfig:
+    output_file: Path
+    west_lon: float
+    south_lat: float
+    east_lon: float
+    north_lat: float
+    browser_path: str
+    render_width: int
+    render_height: int
+    wait_seconds: int
+    load_into_qgis: bool
+    open_first_preview: bool
+
+
+# ----------------------------- Web Mercator math -----------------------------
+
+
+def clamp_lat(lat: float) -> float:
+    return max(min(float(lat), 85.05112878), -85.05112878)
+
+
+def lonlat_to_world_pixel(lon: float, lat: float, z: int = FIXED_ZOOM) -> Tuple[float, float]:
+    lat = clamp_lat(lat)
+    world = float(TILE_SIZE) * (2 ** int(z))
+    x = (float(lon) + 180.0) / 360.0 * world
+    lat_rad = math.radians(lat)
+    y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * world
+    return x, y
+
+
+def world_pixel_to_lonlat(px: float, py: float, z: int = FIXED_ZOOM) -> Tuple[float, float]:
+    world = float(TILE_SIZE) * (2 ** int(z))
+    lon = float(px) / world * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1.0 - 2.0 * float(py) / world)))
+    return lon, math.degrees(lat_rad)
+
+
+def world_pixel_bbox_to_lonlat(
+    left_px: float,
+    top_px: float,
+    right_px: float,
+    bottom_px: float,
+    z: int = FIXED_ZOOM,
+) -> Tuple[float, float, float, float]:
+    west, north = world_pixel_to_lonlat(left_px, top_px, z)
+    east, south = world_pixel_to_lonlat(right_px, bottom_px, z)
+    return west, south, east, north
+
+
+def lonlat_to_webmercator(lon: float, lat: float) -> Tuple[float, float]:
+    lat = clamp_lat(lat)
+    x = WEB_MERCATOR_RADIUS * math.radians(float(lon))
+    y = WEB_MERCATOR_RADIUS * math.log(math.tan(math.pi / 4.0 + math.radians(lat) / 2.0))
+    return x, y
+
+
+def bbox_lonlat_to_webmercator_bounds(west: float, south: float, east: float, north: float) -> Tuple[float, float, float, float]:
+    west_m, north_m = lonlat_to_webmercator(west, north)
+    east_m, south_m = lonlat_to_webmercator(east, south)
+    return west_m, south_m, east_m, north_m
+
+
+def make_apple_frame_url(west: float, south: float, east: float, north: float, cell_id: str) -> str:
+    center_lon = (float(west) + float(east)) / 2.0
+    center_lat = (float(south) + float(north)) / 2.0
+    lon_span = abs(float(east) - float(west))
+    lat_span = abs(float(north) - float(south))
+    return APPLE_MAPS_FRAME_URL.format(
+        center_lat=quote(f"{center_lat:.12f}"),
+        center_lon=quote(f"{center_lon:.12f}"),
+        lat_span=quote(f"{lat_span:.12f}"),
+        lon_span=quote(f"{lon_span:.12f}"),
+        z=FIXED_ZOOM,
+        cell_id=quote(cell_id),
+    )
+
+
+# ----------------------------- Browser detection -----------------------------
+
+
+def browser_candidates() -> List[str]:
+    candidates: List[str] = []
+    system = platform.system().lower()
+    if system == "windows":
+        envs = [os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)"), os.environ.get("LOCALAPPDATA")]
+        rels = [
+            r"Microsoft\Edge\Application\msedge.exe",
+            r"Google\Chrome\Application\chrome.exe",
+            r"Chromium\Application\chrome.exe",
+            r"BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"Vivaldi\Application\vivaldi.exe",
+        ]
+        for root in envs:
+            if not root:
+                continue
+            for rel in rels:
+                candidates.append(str(Path(root) / rel))
+        candidates += ["msedge.exe", "chrome.exe", "chromium.exe", "brave.exe", "vivaldi.exe"]
+    elif system == "darwin":
+        candidates += [
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Vivaldi.app/Contents/MacOS/Vivaldi",
+        ]
+    else:
+        candidates += [
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "vivaldi",
+        ]
+    return candidates
+
+
+def find_browser() -> str:
+    for candidate in browser_candidates():
+        p = Path(candidate)
+        if p.is_absolute() and p.exists():
+            return str(p)
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return ""
+
+
+# ----------------------------- Map rectangle tool -----------------------------
+
+
+class RectangleMapTool(QgsMapTool):
+    rectangleSelected = pyqtSignal(QgsRectangle)
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self.canvas = canvas
+        self.start_point: Optional[QgsPointXY] = None
+        self.end_point: Optional[QgsPointXY] = None
+        self.rubber_band = QgsRubberBand(canvas, QgsWkbTypes.PolygonGeometry)
+        self.rubber_band.setColor(QColor(57, 180, 74, 70))
+        self.rubber_band.setWidth(2)
+
+    def canvasPressEvent(self, event):
+        self.start_point = self.toMapCoordinates(event.pos())
+        self.end_point = self.start_point
+        self._update_rubber_band()
+
+    def canvasMoveEvent(self, event):
+        if self.start_point is None:
+            return
+        self.end_point = self.toMapCoordinates(event.pos())
+        self._update_rubber_band()
+
+    def canvasReleaseEvent(self, event):
+        if self.start_point is None:
+            return
+        self.end_point = self.toMapCoordinates(event.pos())
+        rect = QgsRectangle(self.start_point, self.end_point)
+        rect.normalize()
+        self.rectangleSelected.emit(rect)
+        self.start_point = None
+        self.end_point = None
+
+    def deactivate(self):
+        self.rubber_band.reset(QgsWkbTypes.PolygonGeometry)
+        super().deactivate()
+
+    def _update_rubber_band(self):
+        if self.start_point is None or self.end_point is None:
+            return
+        rect = QgsRectangle(self.start_point, self.end_point)
+        rect.normalize()
+        self.rubber_band.reset(QgsWkbTypes.PolygonGeometry)
+        points = [
+            QgsPointXY(rect.xMinimum(), rect.yMinimum()),
+            QgsPointXY(rect.xMaximum(), rect.yMinimum()),
+            QgsPointXY(rect.xMaximum(), rect.yMaximum()),
+            QgsPointXY(rect.xMinimum(), rect.yMaximum()),
+            QgsPointXY(rect.xMinimum(), rect.yMinimum()),
+        ]
+        for point in points:
+            self.rubber_band.addPoint(point, False)
+        self.rubber_band.show()
+
+
+# --------------------------- External browser renderer --------------------------
+
+
+class ExternalBrowserBatchRenderer(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, cfg: RenderConfig, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.jobs: List[RenderJob] = []
+        self.total = 0
+        self.completed = 0
+        self.cancelled = False
+        self.dataset = None
+        self.temp_dir: Optional[tempfile.TemporaryDirectory] = None
+        self.first_url: Optional[str] = None
+
+    def cancel(self):
+        self.cancelled = True
+
+    def run(self):
+        try:
+            if gdal is None or osr is None:
+                raise RuntimeError("GDAL is not available in this QGIS Python environment.")
+            browser = self.cfg.browser_path.strip() or find_browser()
+            if not browser:
+                raise RuntimeError(
+                    "No Chromium-compatible browser was found. Install Microsoft Edge, Google Chrome, Chromium, Brave, or Vivaldi, "
+                    "or set the browser executable path manually."
+                )
+            self.cfg.browser_path = browser
+            self._prepare_dataset_and_jobs()
+            if self.cfg.open_first_preview and self.first_url:
+                try:
+                    webbrowser.open(self.first_url)
+                except Exception:
+                    pass
+            self._render_jobs_with_external_browser(browser)
+            if self.cancelled:
+                raise RuntimeError("Rendering was cancelled.")
+            self._close_dataset()
+            if self.temp_dir is not None:
+                self.temp_dir.cleanup()
+            self.finished.emit(str(self.cfg.output_file))
+        except Exception as exc:
+            self._close_dataset()
+            try:
+                if self.temp_dir is not None:
+                    self.temp_dir.cleanup()
+            except Exception:
+                pass
+            self.failed.emit(f"External browser rendering failed:\n{exc}\n\n{traceback.format_exc()}")
+
+    def _prepare_dataset_and_jobs(self):
+        west = min(self.cfg.west_lon, self.cfg.east_lon)
+        east = max(self.cfg.west_lon, self.cfg.east_lon)
+        south = min(self.cfg.south_lat, self.cfg.north_lat)
+        north = max(self.cfg.south_lat, self.cfg.north_lat)
+        north = clamp_lat(north)
+        south = clamp_lat(south)
+        if east <= west or north <= south:
+            raise RuntimeError("The selected rectangle is invalid.")
+
+        left_px, top_px = lonlat_to_world_pixel(west, north, FIXED_ZOOM)
+        right_px, bottom_px = lonlat_to_world_pixel(east, south, FIXED_ZOOM)
+        if right_px <= left_px or bottom_px <= top_px:
+            raise RuntimeError("The selected rectangle is too small at zoom 18.")
+
+        render_w = FIXED_RENDER_WIDTH
+        render_h = FIXED_RENDER_HEIGHT
+        visible_w = VISIBLE_RENDER_WIDTH
+        visible_h = VISIBLE_RENDER_HEIGHT
+        if visible_w <= 0 or visible_h <= 0:
+            raise RuntimeError("Invalid crop settings: the cropped visible area is empty.")
+        step_x = float(EFFECTIVE_STEP_X_PX)
+        step_y = float(EFFECTIVE_STEP_Y_PX)
+        cols = max(1, int(math.ceil((right_px - left_px) / step_x)))
+        rows = max(1, int(math.ceil((bottom_px - top_px) / step_y)))
+        self.total = cols * rows
+        if self.total > MAX_CELL_WARNING:
+            raise RuntimeError(
+                f"The selection would create {self.total} external browser capture cells at zoom 18. "
+                f"Please select a smaller area. The safety limit is {MAX_CELL_WARNING} cells."
+            )
+
+        out_width = cols * visible_w
+        out_height = rows * visible_h
+        grid_right_px = left_px + ((cols - 1) * step_x) + visible_w
+        grid_bottom_px = top_px + ((rows - 1) * step_y) + visible_h
+        grid_west, grid_south, grid_east, grid_north = world_pixel_bbox_to_lonlat(
+            left_px, top_px, grid_right_px, grid_bottom_px, FIXED_ZOOM
+        )
+        west_m, south_m, east_m, north_m = bbox_lonlat_to_webmercator_bounds(
+            grid_west, grid_south, grid_east, grid_north
+        )
+
+        self.cfg.output_file.parent.mkdir(parents=True, exist_ok=True)
+        driver = gdal.GetDriverByName("GTiff")
+        if driver is None:
+            raise RuntimeError("GDAL GTiff driver is not available.")
+        options = ["TILED=YES", "COMPRESS=DEFLATE", "BIGTIFF=IF_SAFER", "PHOTOMETRIC=RGB", "INTERLEAVE=PIXEL"]
+        if self.cfg.output_file.exists():
+            try:
+                self.cfg.output_file.unlink()
+            except Exception:
+                pass
+        ds = driver.Create(str(self.cfg.output_file), out_width, out_height, 3, gdal.GDT_Byte, options)
+        if ds is None:
+            raise RuntimeError(f"Could not create output GeoTIFF: {self.cfg.output_file}")
+        pixel_w = (east_m - west_m) / float(out_width)
+        pixel_h = (south_m - north_m) / float(out_height)
+        ds.SetGeoTransform((west_m, pixel_w, 0.0, north_m, 0.0, pixel_h))
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(3857)
+        ds.SetProjection(srs.ExportToWkt())
+        for band_index in range(1, 4):
+            ds.GetRasterBand(band_index).Fill(255)
+        self.dataset = ds
+
+        self.jobs = []
+        stamp = int(time.time() * 1000)
+        for row in range(rows):
+            for col in range(cols):
+                # Target visible output cell after cropping the 1600 x 1600 browser screenshot.
+                # The Apple frame center advances by the fixed frame shift from
+                # the source workflow: +260 px in X and +330 px in Y per cell.
+                visible_left_px = left_px + col * step_x
+                visible_top_px = top_px + row * step_y
+                visible_right_px = visible_left_px + visible_w
+                visible_bottom_px = visible_top_px + visible_h
+
+                # The browser still opens a full 1600 x 1600 Apple Maps frame.
+                # Request a larger/shifted frame so that the cropped rectangle
+                # [left=300, top=0, right=100, bottom=100] lands on the intended
+                # output cell.
+                request_left_px = visible_left_px - CROP_LEFT
+                request_top_px = visible_top_px - CROP_TOP
+                request_right_px = visible_right_px + CROP_RIGHT
+                request_bottom_px = visible_bottom_px + CROP_BOTTOM
+                cw, cs, ce, cn = world_pixel_bbox_to_lonlat(
+                    request_left_px, request_top_px, request_right_px, request_bottom_px, FIXED_ZOOM
+                )
+                url = make_apple_frame_url(cw, cs, ce, cn, f"{row}_{col}_{stamp}_{time.time_ns()}")
+                if self.first_url is None:
+                    self.first_url = url
+                self.jobs.append(RenderJob(col, row, col * visible_w, row * visible_h, visible_w, visible_h, url))
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="apple_maps_qgis_browser_", ignore_cleanup_errors=True)
+        self.progress.emit(
+            0,
+            self.total,
+            f"Prepared {cols} x {rows} cells at zoom 18. Browser capture size is fixed to 1600 x 1600 pixels; "
+            f"saved crop is left {CROP_LEFT}px, right {CROP_RIGHT}px, bottom {CROP_BOTTOM}px "
+            f"=> {VISIBLE_RENDER_WIDTH} x {VISIBLE_RENDER_HEIGHT}px per output cell. "
+            f"Fixed frame shift is X={FRAME_SHIFT_X_PX}px and Y={FRAME_SHIFT_Y_PX}px; "
+            f"effective Apple center step is {EFFECTIVE_STEP_X_PX} x {EFFECTIVE_STEP_Y_PX}px."
+        )
+
+    def _render_jobs_with_external_browser(self, browser: str):
+        for job in self.jobs:
+            if self.cancelled:
+                return
+            self.progress.emit(self.completed, self.total, f"Capturing row {job.row + 1}, column {job.col + 1} with external browser")
+            png_path = Path(self.temp_dir.name) / f"cell_r{job.row}_c{job.col}.png"
+            self._capture_url(browser, job.url, png_path)
+            self._write_png_to_dataset(png_path, job)
+            self.completed += 1
+            self.progress.emit(self.completed, self.total, f"Captured cell {self.completed}/{self.total}")
+
+    def _capture_url(self, browser: str, url: str, png_path: Path):
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        if png_path.exists():
+            try:
+                png_path.unlink()
+            except Exception:
+                pass
+        wait_ms = max(1000, int(self.cfg.wait_seconds) * 1000)
+        user_data_dir = Path(self.temp_dir.name) / "browser_profile"
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+
+        base_args = [
+            browser,
+            "--disable-gpu",
+            "--hide-scrollbars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-popup-blocking",
+            "--force-device-scale-factor=1",
+            f"--user-data-dir={str(user_data_dir)}",
+            f"--window-size={FIXED_RENDER_WIDTH},{FIXED_RENDER_HEIGHT}",
+            f"--screenshot={str(png_path)}",
+            f"--virtual-time-budget={wait_ms}",
+            url,
+        ]
+        variants = ["--headless=new", "--headless"]
+        last_output = ""
+        for headless_flag in variants:
+            cmd = [base_args[0], headless_flag] + base_args[1:]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=max(30, int(self.cfg.wait_seconds) + 45))
+            last_output = proc.stdout or ""
+            if proc.returncode == 0 and png_path.exists() and png_path.stat().st_size > 1000:
+                return
+        raise RuntimeError(f"Browser screenshot failed for URL. Browser output:\n{last_output[-4000:]}")
+
+    def _write_png_to_dataset(self, png_path: Path, job: RenderJob):
+        if self.dataset is None:
+            raise RuntimeError("Output dataset is closed.")
+        src = gdal.Open(str(png_path), gdal.GA_ReadOnly)
+        if src is None:
+            raise RuntimeError(f"GDAL could not read browser screenshot: {png_path}")
+        try:
+            # Browser output should be 1600 x 1600 with force-device-scale-factor=1.
+            # Scale the crop window defensively in case a browser/platform returns a
+            # different physical screenshot size. The output GeoTIFF cell remains
+            # exactly 1200 x 1500 pixels.
+            scale_x = float(src.RasterXSize) / float(FIXED_RENDER_WIDTH)
+            scale_y = float(src.RasterYSize) / float(FIXED_RENDER_HEIGHT)
+            crop_x = max(0, int(round(CROP_LEFT * scale_x)))
+            crop_y = max(0, int(round(CROP_TOP * scale_y)))
+            crop_w = max(1, int(round(VISIBLE_RENDER_WIDTH * scale_x)))
+            crop_h = max(1, int(round(VISIBLE_RENDER_HEIGHT * scale_y)))
+            crop_w = min(crop_w, max(1, src.RasterXSize - crop_x))
+            crop_h = min(crop_h, max(1, src.RasterYSize - crop_y))
+
+            if src.RasterCount < 3:
+                arr = src.GetRasterBand(1).ReadAsArray(crop_x, crop_y, crop_w, crop_h, job.width, job.height)
+                for dst_band in range(1, 4):
+                    self.dataset.GetRasterBand(dst_band).WriteArray(arr, job.xoff, job.yoff)
+            else:
+                for dst_band in range(1, 4):
+                    arr = src.GetRasterBand(dst_band).ReadAsArray(crop_x, crop_y, crop_w, crop_h, job.width, job.height)
+                    self.dataset.GetRasterBand(dst_band).WriteArray(arr, job.xoff, job.yoff)
+            self.dataset.FlushCache()
+        finally:
+            src = None
+            try:
+                png_path.unlink()
+            except Exception:
+                pass
+
+    def _close_dataset(self):
+        try:
+            if self.dataset is not None:
+                self.dataset.FlushCache()
+        finally:
+            self.dataset = None
+
+
+# -------------------------------- Main plugin --------------------------------
+
+
+class AppleMapDownloaderQGISPlugin:
+    def __init__(self, iface):
+        self.iface = iface
+        self.canvas = iface.mapCanvas()
+        self.action: Optional[QAction] = None
+        self.dock: Optional[QDockWidget] = None
+        self.widget: Optional[QWidget] = None
+        self.map_tool: Optional[RectangleMapTool] = None
+        self.previous_map_tool = None
+        self.renderer: Optional[ExternalBrowserBatchRenderer] = None
+        self.thread: Optional[QThread] = None
+
+        self.west_edit: Optional[QLineEdit] = None
+        self.south_edit: Optional[QLineEdit] = None
+        self.east_edit: Optional[QLineEdit] = None
+        self.north_edit: Optional[QLineEdit] = None
+        self.output_edit: Optional[QLineEdit] = None
+        self.browser_edit: Optional[QLineEdit] = None
+        self.wait_spin: Optional[QSpinBox] = None
+        self.load_check: Optional[QCheckBox] = None
+        self.open_preview_check: Optional[QCheckBox] = None
+        self.progress: Optional[QProgressBar] = None
+        self.log: Optional[QPlainTextEdit] = None
+        self.render_button: Optional[QPushButton] = None
+        self.cancel_button: Optional[QPushButton] = None
+
+    def initGui(self):
+        icon_path = str(Path(__file__).with_name("icon.png"))
+        self.action = QAction(QIcon(icon_path), "Apple Maps Downloader", self.iface.mainWindow())
+        self.action.setObjectName("AppleMapsDownloaderQGISAction")
+        self.action.setWhatsThis("Open Apple Maps Downloader QGIS")
+        self.action.triggered.connect(self.show_dock)
+        self.iface.addToolBarIcon(self.action)
+        self.iface.addPluginToMenu(MENU_NAME, self.action)
+
+    def unload(self):
+        try:
+            if self.renderer is not None:
+                self.renderer.cancel()
+        except Exception:
+            pass
+        try:
+            if self.thread is not None:
+                self.thread.quit()
+                self.thread.wait(2000)
+        except Exception:
+            pass
+        if self.map_tool is not None:
+            try:
+                self.map_tool.deactivate()
+            except Exception:
+                pass
+        if self.action is not None:
+            self.iface.removeToolBarIcon(self.action)
+            self.iface.removePluginMenu(MENU_NAME, self.action)
+        if self.dock is not None:
+            self.iface.removeDockWidget(self.dock)
+            self.dock.deleteLater()
+            self.dock = None
+
+    def show_dock(self):
+        if self.dock is None:
+            self._build_dock()
+        self.dock.show()
+        self.dock.raise_()
+
+    def _build_dock(self):
+        self.dock = QDockWidget("Apple Maps Downloader", self.iface.mainWindow())
+        self.dock.setObjectName("AppleMapsDownloaderQGISDock")
+        self.widget = QWidget(self.dock)
+        main = QVBoxLayout(self.widget)
+
+        header = QHBoxLayout()
+        logo = QLabel()
+        logo_path = Path(__file__).with_name("logo.png")
+        pix = QPixmap(str(logo_path))
+        if not pix.isNull():
+            logo.setPixmap(pix.scaled(72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        header.addWidget(logo)
+        title_box = QVBoxLayout()
+        title = QLabel("<b>Apple Maps Downloader</b>")
+        subtitle = QLabel("Select an area and render Apple Maps through an external Chromium/Edge browser. No Qt WebEngine is required.")
+        subtitle.setWordWrap(True)
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        header.addLayout(title_box, 1)
+        main.addLayout(header)
+
+        area_group = QGroupBox("Selected area (WGS 84 / EPSG:4326)")
+        area_form = QFormLayout(area_group)
+        self.west_edit = QLineEdit()
+        self.south_edit = QLineEdit()
+        self.east_edit = QLineEdit()
+        self.north_edit = QLineEdit()
+        for edit in (self.west_edit, self.south_edit, self.east_edit, self.north_edit):
+            edit.setPlaceholderText("not selected")
+        area_form.addRow("West longitude", self.west_edit)
+        area_form.addRow("South latitude", self.south_edit)
+        area_form.addRow("East longitude", self.east_edit)
+        area_form.addRow("North latitude", self.north_edit)
+        area_buttons = QHBoxLayout()
+        select_button = QPushButton("Select area by dragging a rectangle")
+        select_button.clicked.connect(self.activate_rectangle_tool)
+        canvas_button = QPushButton("Use current map extent")
+        canvas_button.clicked.connect(self.use_canvas_extent)
+        area_buttons.addWidget(select_button)
+        area_buttons.addWidget(canvas_button)
+        area_form.addRow(area_buttons)
+        main.addWidget(area_group)
+
+        browser_group = QGroupBox("External browser renderer")
+        browser_form = QFormLayout(browser_group)
+        zoom_label = QLabel("18 (fixed)")
+        browser_form.addRow("Zoom", zoom_label)
+        fixed_size_label = QLabel("1600 x 1600 pixels (fixed)")
+        browser_form.addRow("Browser capture size", fixed_size_label)
+        crop_label = QLabel("left 300 px, top 0 px, right 100 px, bottom 100 px => saved cell 1200 x 1500 px")
+        crop_label.setWordWrap(True)
+        browser_form.addRow("Screenshot crop", crop_label)
+        shift_label = QLabel("X 260 px, Y 330 px => effective Apple center step 1460 x 1830 px")
+        shift_label.setWordWrap(True)
+        browser_form.addRow("Frame shift", shift_label)
+        self.browser_edit = QLineEdit()
+        self.browser_edit.setPlaceholderText("Auto-detect Microsoft Edge / Chrome / Chromium")
+        detected = find_browser()
+        if detected:
+            self.browser_edit.setText(detected)
+        browser_row = QHBoxLayout()
+        browser_row.addWidget(self.browser_edit, 1)
+        detect_button = QPushButton("Detect")
+        detect_button.clicked.connect(self.detect_browser)
+        browse_browser_button = QPushButton("Browse")
+        browse_browser_button.clicked.connect(self.browse_browser)
+        browser_row.addWidget(detect_button)
+        browser_row.addWidget(browse_browser_button)
+        browser_form.addRow("Browser executable", browser_row)
+        self.wait_spin = QSpinBox()
+        self.wait_spin.setRange(1, 60)
+        self.wait_spin.setValue(DEFAULT_WAIT_SECONDS)
+        browser_form.addRow("Render wait / virtual time (seconds)", self.wait_spin)
+        self.open_preview_check = QCheckBox("Open the first Apple Maps cell in the normal browser for preview")
+        self.open_preview_check.setChecked(True)
+        browser_form.addRow("Preview", self.open_preview_check)
+        self.load_check = QCheckBox("Load finished GeoTIFF into QGIS")
+        self.load_check.setChecked(True)
+        browser_form.addRow("QGIS", self.load_check)
+        main.addWidget(browser_group)
+
+        output_group = QGroupBox("Output")
+        output_layout = QHBoxLayout(output_group)
+        self.output_edit = QLineEdit()
+        self.output_edit.setPlaceholderText("Choose an output .tif file")
+        browse_button = QPushButton("Browse")
+        browse_button.clicked.connect(self.browse_output)
+        output_layout.addWidget(self.output_edit, 1)
+        output_layout.addWidget(browse_button)
+        main.addWidget(output_group)
+
+        button_row = QHBoxLayout()
+        self.render_button = QPushButton("Render Apple Maps to GeoTIFF")
+        self.render_button.clicked.connect(self.start_rendering)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_rendering)
+        button_row.addWidget(self.render_button)
+        button_row.addWidget(self.cancel_button)
+        main.addLayout(button_row)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        main.addWidget(self.progress)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(1000)
+        self.log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        main.addWidget(self.log, 1)
+
+        self._log("Ready. This version uses an external browser instead of QtWebEngine/QWebView.")
+        if detected:
+            self._log(f"Detected browser: {detected}")
+        else:
+            self._log("No browser was auto-detected. Set Microsoft Edge, Chrome, or Chromium manually.")
+        self.dock.setWidget(self.widget)
+        self.iface.addDockWidget(Qt.RightDockWidgetArea, self.dock)
+
+    def activate_rectangle_tool(self):
+        self.show_dock()
+        self.previous_map_tool = self.canvas.mapTool()
+        if self.map_tool is None:
+            self.map_tool = RectangleMapTool(self.canvas)
+            self.map_tool.rectangleSelected.connect(self._rectangle_selected)
+        self.canvas.setMapTool(self.map_tool)
+        self._log("Rectangle tool active. Drag a rectangle on the QGIS map canvas.")
+        self.iface.messageBar().pushMessage(PLUGIN_NAME, "Drag a rectangle on the map canvas.", level=Qgis.Info, duration=4)
+
+    def use_canvas_extent(self):
+        rect = self.canvas.extent()
+        self._rectangle_selected(rect)
+
+    def _rectangle_selected(self, rect: QgsRectangle):
+        try:
+            crs_src = self.canvas.mapSettings().destinationCrs()
+            crs_dst = QgsCoordinateReferenceSystem("EPSG:4326")
+            transform = QgsCoordinateTransform(crs_src, crs_dst, QgsProject.instance())
+            p1 = transform.transform(QgsPointXY(rect.xMinimum(), rect.yMinimum()))
+            p2 = transform.transform(QgsPointXY(rect.xMaximum(), rect.yMaximum()))
+            west = min(p1.x(), p2.x())
+            east = max(p1.x(), p2.x())
+            south = min(p1.y(), p2.y())
+            north = max(p1.y(), p2.y())
+            west = max(-180.0, min(180.0, west))
+            east = max(-180.0, min(180.0, east))
+            south = clamp_lat(south)
+            north = clamp_lat(north)
+            self.west_edit.setText(f"{west:.12f}")
+            self.south_edit.setText(f"{south:.12f}")
+            self.east_edit.setText(f"{east:.12f}")
+            self.north_edit.setText(f"{north:.12f}")
+            self._log(f"Selected WGS84 bbox: west={west:.12f}, south={south:.12f}, east={east:.12f}, north={north:.12f}")
+            if self.previous_map_tool is not None:
+                self.canvas.setMapTool(self.previous_map_tool)
+        except Exception as exc:
+            self._error(f"Could not transform selected rectangle to EPSG:4326: {exc}")
+
+    def browse_output(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self.widget,
+            "Choose output GeoTIFF",
+            str(Path.home() / "apple_maps_download_qgis.tif"),
+            "GeoTIFF (*.tif *.tiff)",
+        )
+        if path:
+            if not path.lower().endswith((".tif", ".tiff")):
+                path += ".tif"
+            self.output_edit.setText(path)
+
+    def browse_browser(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self.widget,
+            "Choose Chromium-compatible browser executable",
+            str(Path.home()),
+            "Executable (*.exe);;All files (*)" if platform.system().lower() == "windows" else "All files (*)",
+        )
+        if path:
+            self.browser_edit.setText(path)
+
+    def detect_browser(self):
+        detected = find_browser()
+        if detected:
+            self.browser_edit.setText(detected)
+            self._log(f"Detected browser: {detected}")
+        else:
+            self._error("No Chromium-compatible browser was detected. Install Edge/Chrome/Chromium or browse to the executable manually.")
+
+    def start_rendering(self):
+        try:
+            cfg = self._read_config()
+        except Exception as exc:
+            QMessageBox.warning(self.widget, "Apple Maps Downloader", str(exc))
+            return
+        if self.renderer is not None:
+            QMessageBox.information(self.widget, "Apple Maps Downloader", "A render job is already running.")
+            return
+        self.progress.setValue(0)
+        self.render_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self._log("Starting external browser rendering. Capture size is fixed to 1600 x 1600; crop is left 300 px, right 100 px, bottom 100 px; fixed frame shift is X 260 px and Y 330 px.")
+
+        self.thread = QThread(self.widget)
+        self.renderer = ExternalBrowserBatchRenderer(cfg)
+        self.renderer.moveToThread(self.thread)
+        self.thread.started.connect(self.renderer.run)
+        self.renderer.progress.connect(self._on_progress)
+        self.renderer.finished.connect(self._on_finished)
+        self.renderer.failed.connect(self._on_failed)
+        self.renderer.finished.connect(self.thread.quit)
+        self.renderer.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self._thread_finished)
+        self.thread.start()
+
+    def cancel_rendering(self):
+        if self.renderer is not None:
+            self._log("Cancelling render job...")
+            self.renderer.cancel()
+        self.render_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+
+    def _read_config(self) -> RenderConfig:
+        def parse(edit: QLineEdit, name: str) -> float:
+            text = edit.text().strip().replace(",", ".")
+            if not text:
+                raise ValueError(f"Missing {name}. Select an area first.")
+            return float(text)
+
+        west = parse(self.west_edit, "west longitude")
+        south = parse(self.south_edit, "south latitude")
+        east = parse(self.east_edit, "east longitude")
+        north = parse(self.north_edit, "north latitude")
+        if east <= west or north <= south:
+            raise ValueError("The selected area is invalid. Select a rectangle with positive width and height.")
+        output = self.output_edit.text().strip()
+        if not output:
+            raise ValueError("Choose an output GeoTIFF path first.")
+        if not output.lower().endswith((".tif", ".tiff")):
+            output += ".tif"
+            self.output_edit.setText(output)
+        return RenderConfig(
+            output_file=Path(output),
+            west_lon=west,
+            south_lat=south,
+            east_lon=east,
+            north_lat=north,
+            browser_path=self.browser_edit.text().strip() if self.browser_edit else "",
+            render_width=FIXED_RENDER_WIDTH,
+            render_height=FIXED_RENDER_HEIGHT,
+            wait_seconds=int(self.wait_spin.value()),
+            load_into_qgis=bool(self.load_check.isChecked()),
+            open_first_preview=bool(self.open_preview_check.isChecked()),
+        )
+
+    def _on_progress(self, done: int, total: int, message: str):
+        if total > 0:
+            self.progress.setValue(int((float(done) / float(total)) * 100.0))
+        self._log(message)
+
+    def _on_finished(self, output_path: str):
+        self._log(f"Finished: {output_path}")
+        self.progress.setValue(100)
+        self.render_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        if self.load_check and self.load_check.isChecked():
+            layer = QgsRasterLayer(output_path, Path(output_path).stem)
+            if layer.isValid():
+                QgsProject.instance().addMapLayer(layer)
+                self._log("Loaded GeoTIFF into QGIS.")
+            else:
+                self._log("GeoTIFF was written, but QGIS could not load it as a raster layer.")
+        self.renderer = None
+        self.iface.messageBar().pushMessage(PLUGIN_NAME, "GeoTIFF export finished.", level=Qgis.Success, duration=5)
+
+    def _on_failed(self, message: str):
+        self._error(message)
+        self.render_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.renderer = None
+        QMessageBox.critical(self.widget, "Apple Maps Downloader", message)
+
+    def _thread_finished(self):
+        try:
+            if self.thread is not None:
+                self.thread.deleteLater()
+        except Exception:
+            pass
+        self.thread = None
+
+    def _log(self, message: str):
+        line = f"[{time.strftime('%H:%M:%S')}] {message}"
+        QgsMessageLog.logMessage(message, PLUGIN_NAME, Qgis.Info)
+        if self.log is not None:
+            self.log.appendPlainText(line)
+
+    def _error(self, message: str):
+        QgsMessageLog.logMessage(message, PLUGIN_NAME, Qgis.Critical)
+        if self.log is not None:
+            self.log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] ERROR: {message}")
+        try:
+            self.iface.messageBar().pushMessage(PLUGIN_NAME, message[:220], level=Qgis.Critical, duration=8)
+        except Exception:
+            pass
