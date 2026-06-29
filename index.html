@@ -6,6 +6,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="AppleMapDownloader is a lightweight desktop application for downloading Apple Maps imagery at zoom level 18, stitching large areas, and exporting high-resolution raster outputs for GIS workflows.">
 
+  <script type="module" src="https://get.microsoft.com/badge/ms-store-badge.bundled.js"></script>
+
   <style>
     :root {
       --bg: #080808;
@@ -461,6 +463,22 @@
       font-size: 0.91rem;
     }
 
+    .store-badge-card {
+      align-items: flex-start;
+      gap: 16px;
+    }
+
+    .store-badge-wrap {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      min-height: 64px;
+    }
+
+    ms-store-badge {
+      display: inline-block;
+    }
+
     .snap-badge {
       display: inline-flex;
       width: fit-content;
@@ -758,6 +776,23 @@
         </div>
 
         <div class="download-grid">
+          <article class="download-card featured store-badge-card">
+            <div>
+              <h3>Microsoft Store</h3>
+              <p>Install AppleMapDownloader directly from the Microsoft Store.</p>
+            </div>
+            <div class="store-badge-wrap" aria-label="Get AppleMapDownloader from the Microsoft Store">
+              <ms-store-badge
+                productid="9P9BZ7780S7G"
+                window-mode="full"
+                theme="auto"
+                size="large"
+                language="en-us"
+                animation="on">
+              </ms-store-badge>
+            </div>
+          </article>
+
           <article class="download-card featured">
             <div>
               <h3>Windows OneFile Executable</h3>
